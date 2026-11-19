@@ -1,14 +1,39 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:google_sign_in/google_sign_in.dart';
-import 'package:google_sign_in_web/web_only.dart' as google_web;
+import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'data/nearby_store_repository.dart';
+import 'data/product_catalog_repository.dart';
+import 'models/garment.dart';
+import 'models/nearby_store.dart';
+import 'google_sign_in_web_stub.dart' as google_web
+    if (dart.library.html) 'package:google_sign_in_web/web_only.dart';
+import 'guided_camera_capture.dart';
 
-void main() => runApp(const ModaApp());
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  HttpOverrides.global = _WikimediaFriendlyHttpOverrides();
+  runApp(const ModaApp());
+}
+
+class _WikimediaFriendlyHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    client.userAgent = 'Mozilla/5.0 (compatible; Flutter)';
+    return client;
+  }
+}
 
 const ink = Color(0xFF171717);
 const paper = Color(0xFFFAF9F6);
@@ -27,10 +52,80 @@ class ModaApp extends StatefulWidget {
 class _ModaAppState extends State<ModaApp> {
   bool signedIn = false;
   String customerName = '';
+  bool firebaseConfigured = false;
+  bool checkingSession = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _initFirebase();
+    _loadSavedSession();
+    _requestCameraPermissionOnEntry();
+  }
+
+  Future<void> _requestCameraPermissionOnEntry() async {
+    try {
+      await Permission.camera.request();
+    } catch (_) {}
+  }
+
+  Future<void> _loadSavedSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final isLogged = prefs.getBool('signedIn') ?? false;
+      final savedName = prefs.getString('customerName') ?? '';
+      if (isLogged && mounted) {
+        setState(() {
+          signedIn = true;
+          customerName = savedName.isNotEmpty ? savedName : 'Usuario MODO';
+        });
+      }
+    } catch (_) {}
+    if (mounted) {
+      setState(() => checkingSession = false);
+    }
+  }
+
+  Future<void> _handleSignIn(String name) async {
+    setState(() {
+      customerName = name;
+      signedIn = true;
+    });
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('signedIn', true);
+      await prefs.setString('customerName', name);
+    } catch (_) {}
+  }
+
+  Future<void> _handleSignOut() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('signedIn');
+      await prefs.remove('customerName');
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        signedIn = false;
+        customerName = '';
+      });
+    }
+  }
+
+  Future<void> _initFirebase() async {
+    if (!kIsWeb) {
+      try {
+        await Firebase.initializeApp();
+        if (mounted) setState(() => firebaseConfigured = true);
+      } catch (error, stackTrace) {
+        debugPrint('Firebase initialization failed: $error\n$stackTrace');
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'MODO — moda que te queda',
+    title: 'Grupo5',
     debugShowCheckedModeBanner: false,
     theme: ThemeData(
       useMaterial3: true,
@@ -38,14 +133,22 @@ class _ModaAppState extends State<ModaApp> {
       colorScheme: ColorScheme.fromSeed(seedColor: ink, surface: paper),
       fontFamily: 'Roboto',
     ),
-    home: signedIn
-        ? ShopShell(customerName: customerName)
-        : LoginScreen(
-            onAuthenticated: (name) => setState(() {
-              customerName = name;
-              signedIn = true;
-            }),
-          ),
+    home: checkingSession
+        ? const Scaffold(
+            backgroundColor: paper,
+            body: Center(
+              child: CircularProgressIndicator(color: ink),
+            ),
+          )
+        : signedIn
+            ? ShopShell(
+                customerName: customerName,
+                firebaseConfigured: firebaseConfigured,
+                onSignOut: _handleSignOut,
+              )
+            : LoginScreen(
+                onAuthenticated: _handleSignIn,
+              ),
   );
 }
 
@@ -65,6 +168,7 @@ class _LoginScreenState extends State<LoginScreen> {
   StreamSubscription<GoogleSignInAuthenticationEvent>? googleSubscription;
   bool registering = false;
   bool googleReady = false;
+  bool obscurePassword = true;
 
   @override
   void initState() {
@@ -73,9 +177,10 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _initializeGoogle() async {
+    if (googleClientId.isEmpty) return;
     try {
       await GoogleSignIn.instance.initialize(
-        clientId: googleClientId.isEmpty ? null : googleClientId,
+        clientId: googleClientId,
       );
       googleSubscription = GoogleSignIn.instance.authenticationEvents.listen(
         (event) {
@@ -312,7 +417,18 @@ class _LoginScreenState extends State<LoginScreen> {
             passwordController,
             'Contraseña',
             Icons.lock_outline,
-            obscure: true,
+            obscure: obscurePassword,
+            suffixIcon: IconButton(
+              icon: Icon(
+                obscurePassword
+                    ? Icons.visibility_outlined
+                    : Icons.visibility_off_outlined,
+                size: 20,
+                color: muted,
+              ),
+              onPressed: () =>
+                  setState(() => obscurePassword = !obscurePassword),
+            ),
             validator: (v) => (v == null || v.length < 6)
                 ? 'Usa al menos 6 caracteres'
                 : null,
@@ -423,6 +539,7 @@ class _LoginScreenState extends State<LoginScreen> {
     String hint,
     IconData icon, {
     bool obscure = false,
+    Widget? suffixIcon,
     TextInputType? keyboardType,
     String? Function(String?)? validator,
   }) => TextFormField(
@@ -432,6 +549,7 @@ class _LoginScreenState extends State<LoginScreen> {
     validator: validator,
     decoration: InputDecoration(
       prefixIcon: Icon(icon, size: 19),
+      suffixIcon: suffixIcon,
       hintText: hint,
       filled: true,
       fillColor: const Color(0xFFFAFAF8),
@@ -453,62 +571,229 @@ class _LoginScreenState extends State<LoginScreen> {
   );
 }
 
-class Garment {
-  final String name, category, price, image, tag;
-  const Garment(this.name, this.category, this.price, this.image, this.tag);
+String photo(String source, {int width = 800}) {
+  if (source.startsWith('https://') || source.startsWith('http://')) {
+    return source;
+  }
+  return 'https://images.unsplash.com/$source?auto=format&fit=crop&w=$width&q=85';
 }
-
-const products = [
-  Garment(
-    'Chaqueta de ante',
-    'NUEVA TEMPORADA',
-    'S/ 289',
-    'photo-1544923246-77307dd654cb',
-    'NUEVO',
-  ),
-  Garment(
-    'Camisa algodón',
-    'ESENCIALES',
-    'S/ 149',
-    'photo-1596755094514-f87e34085b2c',
-    'BEST SELLER',
-  ),
-  Garment(
-    'Look urbano',
-    'EDITORIAL',
-    'S/ 239',
-    'photo-1529139574466-a303027c1d8b',
-    '−20%',
-  ),
-  Garment(
-    'Polo de punto',
-    'ESENCIALES',
-    'S/ 119',
-    'photo-1576566588028-4147f3842f27',
-    'NUEVO',
-  ),
-];
-
-String photo(String id, {int width = 800}) =>
-    'https://images.unsplash.com/$id?auto=format&fit=crop&w=$width&q=85';
 
 class ShopShell extends StatefulWidget {
   final String customerName;
-  const ShopShell({super.key, required this.customerName});
+  final bool firebaseConfigured;
+  final VoidCallback? onSignOut;
+  const ShopShell({
+    super.key,
+    required this.customerName,
+    this.firebaseConfigured = false,
+    this.onSignOut,
+  });
   @override
   State<ShopShell> createState() => _ShopShellState();
 }
 
 class _ShopShellState extends State<ShopShell> {
   int tab = 0;
+  DateTime? lastBackPressTime;
   String category = 'Todo';
-  int cartCount = 0;
+  final Map<String, int> cartQuantities = {};
+
+  int get cartCount =>
+      cartQuantities.values.fold<int>(0, (total, quantity) => total + quantity);
   bool largeText = false;
   bool highContrast = false;
   bool reduceMotion = false;
-  final Set<int> favorites = {};
+  final Set<String> favorites = {};
+  final List<Garment> catalogProducts = [];
+  StreamSubscription<List<Garment>>? catalogSubscription;
+  bool catalogLoading = true;
+  String? catalogError;
   Uint8List? frontPhoto, sidePhoto;
   final picker = ImagePicker();
+
+  @override
+  void initState() {
+    super.initState();
+    _syncCatalogSubscription(notify: false);
+  }
+
+  @override
+  void didUpdateWidget(covariant ShopShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.firebaseConfigured != widget.firebaseConfigured) {
+      _syncCatalogSubscription();
+    }
+  }
+
+  void _syncCatalogSubscription({bool notify = true}) {
+    void apply(VoidCallback fn) {
+      if (notify && mounted) {
+        setState(fn);
+      } else {
+        fn();
+      }
+    }
+
+    if (!widget.firebaseConfigured) {
+      catalogSubscription?.cancel();
+      catalogSubscription = null;
+      apply(() {
+        catalogLoading = false;
+        catalogError = kIsWeb
+            ? 'La configuración Firebase para web todavía no está agregada.'
+            : 'No se pudo iniciar Firebase. Revisa la configuración de Android.';
+      });
+      return;
+    }
+
+    if (catalogSubscription != null) return;
+
+    apply(() {
+      catalogLoading = true;
+      catalogError = null;
+    });
+
+    catalogSubscription = ProductCatalogRepository().watchProducts().listen(
+      (items) {
+        if (!mounted) return;
+        setState(() {
+          catalogProducts
+            ..clear()
+            ..addAll(items);
+          catalogLoading = false;
+          catalogError = null;
+        });
+      },
+      onError: (Object error) {
+        if (!mounted) return;
+        setState(() {
+          catalogLoading = false;
+          catalogError = 'No se pudo leer la colección productos de Firebase.';
+        });
+      },
+    );
+  }
+
+  @override
+  void dispose() {
+    catalogSubscription?.cancel();
+    super.dispose();
+  }
+
+  List<String> get catalogCategories {
+    final categories =
+        catalogProducts.map((product) => product.category).toSet().toList()
+          ..sort();
+    return ['Todo', ...categories];
+  }
+
+  List<Garment> get visibleProducts => category == 'Todo'
+      ? catalogProducts
+      : catalogProducts
+            .where((product) => product.category == category)
+            .toList();
+
+  Widget catalogNotice({required String title, required String subtitle}) =>
+      Container(
+        margin: const EdgeInsets.fromLTRB(20, 18, 20, 12),
+        padding: const EdgeInsets.all(18),
+        width: double.infinity,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          border: Border.all(color: line),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          children: [
+            if (catalogLoading)
+              const CircularProgressIndicator(color: ink)
+            else
+              const Icon(Icons.checkroom_outlined, size: 32, color: muted),
+            const SizedBox(height: 10),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              subtitle,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: muted, fontSize: 12),
+            ),
+          ],
+        ),
+      );
+
+  List<Widget> homeProductSection() {
+    if (catalogLoading || catalogError != null || catalogProducts.isEmpty) {
+      return [
+        SliverToBoxAdapter(
+          child: catalogNotice(
+            title: catalogLoading
+                ? 'Cargando prendas'
+                : catalogError != null
+                ? 'No se pudo cargar la tienda'
+                : 'Todavía no hay prendas',
+            subtitle:
+                catalogError ?? 'Las prendas de Firebase aparecerán aquí.',
+          ),
+        ),
+      ];
+    }
+    return [
+      SliverPadding(
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+        sliver: SliverGrid(
+          delegate: SliverChildBuilderDelegate(
+            (_, i) => productCardItem(catalogProducts[i]),
+            childCount: catalogProducts.length < 6 ? catalogProducts.length : 6,
+          ),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            crossAxisSpacing: 14,
+            mainAxisSpacing: 18,
+            childAspectRatio: .59,
+          ),
+        ),
+      ),
+    ];
+  }
+
+  List<Widget> shopProductSection() {
+    if (catalogLoading || catalogError != null || visibleProducts.isEmpty) {
+      return [
+        SliverToBoxAdapter(
+          child: catalogNotice(
+            title: catalogLoading
+                ? 'Cargando prendas'
+                : catalogError != null
+                ? 'No se pudo cargar la tienda'
+                : 'No hay prendas en esta categoría',
+            subtitle:
+                catalogError ?? 'Revisa tu conexión e intenta nuevamente.',
+          ),
+        ),
+      ];
+    }
+    return [
+      SliverPadding(
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+        sliver: SliverGrid(
+          delegate: SliverChildBuilderDelegate(
+            (_, i) => productCardItem(visibleProducts[i]),
+            childCount: visibleProducts.length,
+          ),
+          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            crossAxisSpacing: 14,
+            mainAxisSpacing: 18,
+            childAspectRatio: .59,
+          ),
+        ),
+      ),
+    ];
+  }
 
   Future<void> pickCapture(bool front) async {
     final image = await picker.pickImage(
@@ -526,61 +811,134 @@ class _ShopShellState extends State<ShopShell> {
     });
   }
 
+  Future<void> openGuidedCapture() async {
+    final result = await Navigator.of(context).push<GuidedCaptureResult>(
+      MaterialPageRoute(
+        builder: (_) => GuidedCameraCapturePage(
+          initialIsFront: frontPhoto == null,
+        ),
+      ),
+    );
+    if (result == null) return;
+    setState(() {
+      if (result.isFront) {
+        frontPhoto = Uint8List.fromList(result.bytes);
+      } else {
+        sidePhoto = Uint8List.fromList(result.bytes);
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     final screens = [home(), shop(), fittingRoom(), cart(), accountSettings()];
     final baseTheme = Theme.of(context);
-    return Theme(
-      data: baseTheme.copyWith(
-        colorScheme: highContrast
-            ? ColorScheme.fromSeed(
-                seedColor: ink,
-                surface: paper,
-                contrastLevel: 1,
-              )
-            : baseTheme.colorScheme,
-      ),
-      child: MediaQuery(
-        data: MediaQuery.of(context).copyWith(
-          textScaler: TextScaler.linear(largeText ? 1.15 : 1),
-          disableAnimations: reduceMotion,
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        if (tab != 0) {
+          setState(() => tab = 0);
+          return;
+        }
+        final now = DateTime.now();
+        if (lastBackPressTime == null ||
+            now.difference(lastBackPressTime!) > const Duration(seconds: 2)) {
+          lastBackPressTime = now;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Presiona de nuevo para salir de MODO'),
+              duration: Duration(seconds: 2),
+            ),
+          );
+          return;
+        }
+        SystemNavigator.pop();
+      },
+      child: Theme(
+        data: baseTheme.copyWith(
+          colorScheme: highContrast
+              ? ColorScheme.fromSeed(
+                  seedColor: ink,
+                  surface: paper,
+                  contrastLevel: 1,
+                )
+              : baseTheme.colorScheme,
         ),
-        child: Scaffold(
-          body: SafeArea(
-            child: IndexedStack(index: tab, children: screens),
+        child: MediaQuery(
+          data: MediaQuery.of(context).copyWith(
+            textScaler: TextScaler.linear(largeText ? 1.15 : 1),
+            disableAnimations: reduceMotion,
           ),
-          bottomNavigationBar: NavigationBar(
-            height: 68,
-            backgroundColor: Colors.white,
-            indicatorColor: const Color(0xFFECEAE4),
-            selectedIndex: tab,
-            onDestinationSelected: (value) => setState(() => tab = value),
-            destinations: [
-              const NavigationDestination(
-                icon: Icon(Icons.grid_view_rounded),
-                label: 'Inicio',
+          child: Scaffold(
+            body: SafeArea(
+              child: AnimatedSwitcher(
+                duration: reduceMotion
+                    ? Duration.zero
+                    : const Duration(milliseconds: 260),
+                switchInCurve: Curves.easeOutCubic,
+                switchOutCurve: Curves.easeInCubic,
+                transitionBuilder: (child, animation) {
+                  final slide =
+                      Tween<Offset>(
+                        begin: const Offset(.035, 0),
+                        end: Offset.zero,
+                      ).animate(
+                        CurvedAnimation(
+                          parent: animation,
+                          curve: Curves.easeOutCubic,
+                        ),
+                      );
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(position: slide, child: child),
+                  );
+                },
+                child: KeyedSubtree(key: ValueKey(tab), child: screens[tab]),
               ),
-              const NavigationDestination(
-                icon: Icon(Icons.shopping_bag_outlined),
-                label: 'Tienda',
-              ),
-              const NavigationDestination(
-                icon: Icon(Icons.auto_awesome_outlined),
-                label: 'Probador IA',
-              ),
-              NavigationDestination(
-                icon: Badge(
-                  isLabelVisible: cartCount > 0,
-                  label: Text('$cartCount'),
-                  child: const Icon(Icons.shopping_basket_outlined),
+            ),
+            bottomNavigationBar: NavigationBar(
+              height: 68,
+              backgroundColor: Colors.white,
+              indicatorColor: const Color(0xFFECEAE4),
+              selectedIndex: tab,
+              onDestinationSelected: (value) => setState(() => tab = value),
+              destinations: [
+                const NavigationDestination(
+                  icon: Icon(Icons.grid_view_outlined),
+                  selectedIcon: Icon(Icons.grid_view_rounded),
+                  label: 'Inicio',
                 ),
-                label: 'Bolsa',
-              ),
-              const NavigationDestination(
-                icon: Icon(Icons.person_outline_rounded),
-                label: 'Cuenta',
-              ),
-            ],
+                const NavigationDestination(
+                  icon: Icon(Icons.shopping_bag_outlined),
+                  selectedIcon: Icon(Icons.shopping_bag_rounded),
+                  label: 'Tienda',
+                ),
+                const NavigationDestination(
+                  icon: Icon(Icons.auto_awesome_outlined),
+                  selectedIcon: Icon(Icons.auto_awesome_rounded),
+                  label: 'Probador IA',
+                ),
+                NavigationDestination(
+                  icon: Badge(
+                    isLabelVisible: cartCount > 0,
+                    label: Text('$cartCount'),
+                    child: const Icon(Icons.shopping_basket_outlined),
+                  ),
+                  selectedIcon: Badge(
+                    isLabelVisible: cartCount > 0,
+                    label: Text('$cartCount'),
+                    child: const Icon(Icons.shopping_basket_rounded),
+                  ),
+                  label: 'Bolsa',
+                ),
+                const NavigationDestination(
+                  icon: Icon(Icons.person_outline_rounded),
+                  selectedIcon: Icon(Icons.person_rounded),
+                  label: 'Cuenta',
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -691,6 +1049,35 @@ class _ShopShellState extends State<ShopShell> {
                 onChanged: (value) => setState(() => reduceMotion = value),
               ),
               const SizedBox(height: 24),
+              if (widget.onSignOut != null) ...[
+                const Divider(),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: OutlinedButton.icon(
+                    onPressed: widget.onSignOut,
+                    icon: const Icon(
+                      Icons.logout_rounded,
+                      size: 18,
+                      color: Colors.redAccent,
+                    ),
+                    label: const Text(
+                      'CERRAR SESIÓN',
+                      style: TextStyle(
+                        color: Colors.redAccent,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: .5,
+                      ),
+                    ),
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: Colors.redAccent),
+                      shape: const StadiumBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+              ],
             ],
           ),
         ),
@@ -714,21 +1101,7 @@ class _ShopShellState extends State<ShopShell> {
           () => setState(() => tab = 1),
         ),
       ),
-      SliverPadding(
-        padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-        sliver: SliverGrid(
-          delegate: SliverChildBuilderDelegate(
-            (_, i) => productCard(i),
-            childCount: products.length < 4 ? products.length : 4,
-          ),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            crossAxisSpacing: 14,
-            mainAxisSpacing: 18,
-            childAspectRatio: .59,
-          ),
-        ),
-      ),
+      ...homeProductSection(),
       SliverToBoxAdapter(
         child: Padding(
           padding: const EdgeInsets.fromLTRB(20, 18, 20, 28),
@@ -757,10 +1130,13 @@ class _ShopShellState extends State<ShopShell> {
           decoration: const BoxDecoration(color: lime, shape: BoxShape.circle),
         ),
         const Spacer(),
-        IconButton(onPressed: () {}, icon: const Icon(Icons.search_rounded)),
+        IconButton(
+          onPressed: () => setState(() => tab = 1),
+          icon: const Icon(Icons.search_rounded),
+        ),
         IconButton(
           onPressed: () => setState(() => tab = 3),
-          icon: const Icon(Icons.shopping_bag_outlined),
+          icon: const Icon(Icons.shopping_basket_outlined),
         ),
       ],
     ),
@@ -859,10 +1235,9 @@ class _ShopShellState extends State<ShopShell> {
         ),
       );
 
-  Widget productCard(int index) {
-    final p = products[index];
+  Widget productCardItem(Garment p) {
     return GestureDetector(
-      onTap: () => showProduct(index),
+      onTap: () => showProduct(p),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -891,12 +1266,12 @@ class _ShopShellState extends State<ShopShell> {
                   right: 4,
                   child: IconButton.filledTonal(
                     onPressed: () => setState(
-                      () => favorites.contains(index)
-                          ? favorites.remove(index)
-                          : favorites.add(index),
+                      () => favorites.contains(p.id)
+                          ? favorites.remove(p.id)
+                          : favorites.add(p.id),
                     ),
                     icon: Icon(
-                      favorites.contains(index)
+                      favorites.contains(p.id)
                           ? Icons.favorite
                           : Icons.favorite_border,
                       size: 18,
@@ -1012,7 +1387,7 @@ class _ShopShellState extends State<ShopShell> {
               SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: Row(
-                  children: ['Todo', 'Mujer', 'Hombre', 'Accesorios']
+                  children: catalogCategories
                       .map(
                         (c) => Padding(
                           padding: const EdgeInsets.only(right: 8),
@@ -1037,21 +1412,7 @@ class _ShopShellState extends State<ShopShell> {
           ),
         ),
       ),
-      SliverPadding(
-        padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
-        sliver: SliverGrid(
-          delegate: SliverChildBuilderDelegate(
-            (_, i) => productCard(i),
-            childCount: products.length,
-          ),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 2,
-            crossAxisSpacing: 14,
-            mainAxisSpacing: 18,
-            childAspectRatio: .59,
-          ),
-        ),
-      ),
+      ...shopProductSection(),
     ],
   );
 
@@ -1094,6 +1455,30 @@ class _ShopShellState extends State<ShopShell> {
                   Expanded(child: captureCard(false)),
                 ],
               ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                height: 56,
+                child: FilledButton.icon(
+                  onPressed: openGuidedCapture,
+                  icon: const Icon(Icons.photo_camera_outlined),
+                  label: const Text(
+                    'TOMAR FOTO GUIADA (FRONTAL / LATERAL)',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: .2,
+                    ),
+                  ),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: lime,
+                    foregroundColor: ink,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
               const SizedBox(height: 20),
               Container(
                 padding: const EdgeInsets.all(15),
@@ -1134,7 +1519,7 @@ class _ShopShellState extends State<ShopShell> {
                 height: 122,
                 child: ListView.separated(
                   scrollDirection: Axis.horizontal,
-                  itemCount: products.length,
+                  itemCount: catalogProducts.length,
                   separatorBuilder: (_, _) => const SizedBox(width: 10),
                   itemBuilder: (_, i) => GestureDetector(
                     onTap: () => setState(() => selectedLook = i),
@@ -1149,7 +1534,7 @@ class _ShopShellState extends State<ShopShell> {
                       ),
                       clipBehavior: Clip.antiAlias,
                       child: Image.network(
-                        photo(products[i].image, width: 220),
+                        photo(catalogProducts[i].image, width: 220),
                         fit: BoxFit.cover,
                         errorBuilder: (_, _, _) => const Icon(Icons.checkroom),
                       ),
@@ -1275,6 +1660,89 @@ class _ShopShellState extends State<ShopShell> {
     );
   }
 
+  List<Widget> cartProductItems() {
+    if (catalogProducts.isEmpty) {
+      return const [
+        Padding(
+          padding: EdgeInsets.all(18),
+          child: Text('No se pudo recuperar el detalle de las prendas.'),
+        ),
+      ];
+    }
+    if (cartQuantities.isEmpty) {
+      return const [];
+    }
+    final items = <Widget>[];
+    for (final entry in cartQuantities.entries) {
+      final product = catalogProducts.firstWhere(
+        (item) => item.id == entry.key,
+        orElse: () => catalogProducts.first,
+      );
+      final quantity = entry.value;
+      items.add(
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          leading: ClipRRect(
+            borderRadius: BorderRadius.circular(5),
+            child: Image.network(
+              photo(product.image, width: 160),
+              width: 70,
+              height: 86,
+              fit: BoxFit.cover,
+            ),
+          ),
+          title: Text(product.name),
+          subtitle: Text('${product.price} · Cantidad: $quantity'),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                onPressed: () => setState(() {
+                  if (quantity <= 1) {
+                    cartQuantities.remove(entry.key);
+                  } else {
+                    cartQuantities[entry.key] = quantity - 1;
+                  }
+                }),
+                icon: const Icon(Icons.remove_circle_outline),
+              ),
+              Text('$quantity'),
+              IconButton(
+                onPressed: () => setState(() {
+                  cartQuantities[entry.key] = quantity + 1;
+                }),
+                icon: const Icon(Icons.add_circle_outline),
+              ),
+              IconButton(
+                onPressed: () => setState(() => cartQuantities.remove(entry.key)),
+                icon: const Icon(Icons.close),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return items;
+  }
+
+  double _cartTotal() {
+    double total = 0;
+    for (final entry in cartQuantities.entries) {
+      final product = catalogProducts.firstWhere(
+        (item) => item.id == entry.key,
+        orElse: () => catalogProducts.first,
+      );
+      total += _priceToNumber(product.price) * entry.value;
+    }
+    return total;
+  }
+
+  double _priceToNumber(String price) {
+    final match = RegExp(r'(\d+(?:[.,]\d+)?)').firstMatch(price);
+    if (match == null) return 0;
+    return double.tryParse(match.group(1)!.replaceAll(',', '.')) ?? 0;
+  }
+
   Widget cart() => CustomScrollView(
     slivers: [
       SliverToBoxAdapter(child: header()),
@@ -1342,41 +1810,43 @@ class _ShopShellState extends State<ShopShell> {
             padding: const EdgeInsets.symmetric(horizontal: 20),
             child: Column(
               children: [
-                for (var i = 0; i < cartCount; i++)
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    leading: ClipRRect(
-                      borderRadius: BorderRadius.circular(5),
-                      child: Image.network(
-                        photo(products[i % products.length].image, width: 160),
-                        width: 70,
-                        height: 86,
-                        fit: BoxFit.cover,
-                      ),
-                    ),
-                    title: Text(products[i % products.length].name),
-                    subtitle: Text(products[i % products.length].price),
-                    trailing: IconButton(
-                      onPressed: () => setState(() => cartCount--),
-                      icon: const Icon(Icons.close),
-                    ),
-                  ),
+                ...cartProductItems(),
                 const Divider(),
                 ListTile(
                   title: const Text('Subtotal'),
                   trailing: Text(
-                    'S/ ${cartCount * 149}.00',
+                    'S/ ${_cartTotal().toStringAsFixed(2)}',
                     style: const TextStyle(fontWeight: FontWeight.w800),
                   ),
                 ),
-                SizedBox(
-                  width: double.infinity,
-                  height: 52,
-                  child: FilledButton(
-                    onPressed: () {},
-                    style: FilledButton.styleFrom(backgroundColor: ink),
-                    child: const Text('CONTINUAR COMPRA'),
-                  ),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => setState(() => tab = 1),
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(0, 52),
+                          foregroundColor: ink,
+                          side: const BorderSide(color: line),
+                          shape: const StadiumBorder(),
+                        ),
+                        child: const Text('SEGUIR COMPRANDO'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: FilledButton(
+                        onPressed: showCheckoutDialog,
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(0, 52),
+                          backgroundColor: ink,
+                          foregroundColor: Colors.white,
+                          shape: const StadiumBorder(),
+                        ),
+                        child: const Text('FINALIZAR COMPRA'),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -1385,15 +1855,88 @@ class _ShopShellState extends State<ShopShell> {
     ],
   );
 
-  void showProduct(int index) {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => ProductDetailPage(
-          product: products[index],
-          onAddToCart: () => setState(() => cartCount++),
-          onTryWithAi: () {
-            setState(() => tab = 2);
+  void showCheckoutDialog() => showDialog(
+    context: context,
+    builder: (_) => AlertDialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: Row(
+        children: const [
+          Icon(Icons.check_circle_rounded, color: Colors.green, size: 28),
+          SizedBox(width: 10),
+          Text(
+            'Boleta de Venta',
+            style: TextStyle(fontWeight: FontWeight.w900, fontSize: 18),
+          ),
+        ],
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'MODO STORE S.A.C. - RUC 20608976541\nComprobante Electrónico (Demo)',
+            style: TextStyle(color: muted, fontSize: 11),
+          ),
+          const Divider(height: 20),
+          Text(
+            'Cliente: ${widget.customerName.isEmpty ? 'Usuario MODO' : widget.customerName}',
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 6),
+          Text('Prendas en orden: $cartCount artículos'),
+          const SizedBox(height: 4),
+          Text(
+            'Total Pagado: S/ ${_cartTotal().toStringAsFixed(2)}',
+            style: const TextStyle(
+              fontWeight: FontWeight.w900,
+              fontSize: 17,
+              color: ink,
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            '¡Pago procesado con éxito! Se ha registrado tu orden en el historial.',
+            style: TextStyle(fontSize: 12, color: muted),
+          ),
+        ],
+      ),
+      actions: [
+        FilledButton(
+          onPressed: () {
+            Navigator.pop(context);
+            setState(() => cartQuantities.clear());
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('¡Compra finalizada exitosamente!'),
+                duration: Duration(seconds: 2),
+              ),
+            );
           },
+          style: FilledButton.styleFrom(backgroundColor: ink),
+          child: const Text('ACEPTAR'),
+        ),
+      ],
+    ),
+  );
+
+  void showProduct(Garment product) {
+    Navigator.of(context).push(
+      _FadeSlideRoute<void>(
+        builder: (_) => ProductDetailPage(
+          product: product,
+          isFavorite: favorites.contains(product.id),
+          onToggleFavorite: () => setState(() {
+            favorites.contains(product.id)
+                ? favorites.remove(product.id)
+                : favorites.add(product.id);
+          }),
+          onAddToCart: (product) => setState(() {
+            cartQuantities[product.id] =
+                (cartQuantities[product.id] ?? 0) + 1;
+          }),
+          onOpenCart: () => setState(() => tab = 3),
+          onTryWithAi: () => setState(() => tab = 2),
         ),
       ),
     );
@@ -1434,15 +1977,52 @@ class _ShopShellState extends State<ShopShell> {
   );
 }
 
+const Map<String, String> storeDisplayNames = {
+  'store_real_plaza_huancayo': 'MODO - Real Plaza Huancayo',
+  'store_open_plaza_huancayo': 'MODO - Open Plaza Huancayo',
+  'store_plaza_constitucion': 'MODO - Centro Huancayo',
+};
+
+Future<void> openStoreLocation(BuildContext context, String storeId) async {
+  if (storeId.trim().isEmpty) return;
+  final source = FirestoreNearbyStoreDataSource();
+  final stores = await source.getStores();
+  StoreRecord? store;
+  for (final candidate in stores) {
+    if (candidate.id == storeId) {
+      store = candidate;
+      break;
+    }
+  }
+  if (store == null) return;
+  final uri = Uri.parse(
+    'https://www.google.com/maps/search/?api=1&query=${store.latitude},${store.longitude}',
+  );
+  if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No se pudo abrir el mapa.')),
+      );
+    }
+  }
+}
+
 class ProductDetailPage extends StatefulWidget {
   final Garment product;
-  final VoidCallback onAddToCart;
+  final void Function(Garment product) onAddToCart;
   final VoidCallback onTryWithAi;
+  final VoidCallback? onOpenCart;
+  final bool isFavorite;
+  final VoidCallback? onToggleFavorite;
+
   const ProductDetailPage({
     super.key,
     required this.product,
     required this.onAddToCart,
     required this.onTryWithAi,
+    this.onOpenCart,
+    this.isFavorite = false,
+    this.onToggleFavorite,
   });
 
   @override
@@ -1453,15 +2033,20 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
   String size = 'M';
   int quantity = 1;
   int imageIndex = 0;
+  late bool localFavorite;
+
+  @override
+  void initState() {
+    super.initState();
+    localFavorite = widget.isFavorite;
+  }
 
   @override
   Widget build(BuildContext context) {
     final p = widget.product;
     final images = [
       p.image,
-      ...products
-          .where((item) => item.image != p.image)
-          .map((item) => item.image),
+      // Product images come from the selected Firestore document.
     ];
     return Scaffold(
       backgroundColor: Colors.white,
@@ -1486,8 +2071,11 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                       ),
                     ),
                     IconButton(
-                      onPressed: () {},
-                      icon: const Icon(Icons.shopping_bag_outlined),
+                      onPressed: () {
+                        Navigator.pop(context);
+                        widget.onOpenCart?.call();
+                      },
+                      icon: const Icon(Icons.shopping_basket_outlined),
                     ),
                   ],
                 ),
@@ -1528,8 +2116,13 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                         right: 10,
                         top: 12,
                         child: CircleButton(
-                          icon: Icons.favorite_border,
-                          onTap: () {},
+                          icon: localFavorite
+                              ? Icons.favorite
+                              : Icons.favorite_border,
+                          onTap: () {
+                            setState(() => localFavorite = !localFavorite);
+                            widget.onToggleFavorite?.call();
+                          },
                         ),
                       ),
                       Positioned(
@@ -1654,6 +2247,28 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                       'Una pieza versátil, cómoda y fácil de combinar. Diseñada para acompañarte en cualquier ocasión.',
                       style: TextStyle(color: muted, fontSize: 12, height: 1.5),
                     ),
+                    if (p.store.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        'Tienda: ${storeDisplayNames[p.store] ?? p.store}',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      OutlinedButton.icon(
+                        onPressed: () => openStoreLocation(context, p.store),
+                        icon: const Icon(Icons.map_outlined, size: 17),
+                        label: const Text('Ir a la tienda'),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: ink,
+                          side: const BorderSide(color: line),
+                          minimumSize: const Size(double.infinity, 44),
+                          shape: const StadiumBorder(),
+                        ),
+                      ),
+                    ],
                     const SizedBox(height: 15),
                     const Text(
                       'TALLA',
@@ -1688,9 +2303,28 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                     ),
                     const SizedBox(height: 16),
                     OutlinedButton.icon(
-                      onPressed: widget.onTryWithAi,
+                      onPressed: () {
+                        Navigator.pop(context);
+                        widget.onTryWithAi();
+                      },
                       icon: const Icon(Icons.auto_awesome, size: 16),
                       label: const Text('Probarme esta prenda con IA'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: ink,
+                        side: const BorderSide(color: line),
+                        minimumSize: const Size(double.infinity, 44),
+                        shape: const StadiumBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: () => Navigator.of(context).push(
+                        _FadeSlideRoute<void>(
+                          builder: (_) => NearbyStoresPage(product: p),
+                        ),
+                      ),
+                      icon: const Icon(Icons.location_on_outlined, size: 17),
+                      label: const Text('Ver tiendas cercanas con stock'),
                       style: OutlinedButton.styleFrom(
                         foregroundColor: ink,
                         side: const BorderSide(color: line),
@@ -1758,9 +2392,20 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                   child: FilledButton(
                     onPressed: () {
                       for (var i = 0; i < quantity; i++) {
-                        widget.onAddToCart();
+                        widget.onAddToCart(widget.product);
                       }
                       Navigator.pop(context);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('${widget.product.name} añadido a la bolsa'),
+                          duration: const Duration(seconds: 2),
+                          action: SnackBarAction(
+                            label: 'VER BOLSA',
+                            textColor: lime,
+                            onPressed: () => widget.onOpenCart?.call(),
+                          ),
+                        ),
+                      );
                     },
                     style: FilledButton.styleFrom(
                       backgroundColor: ink,
@@ -1786,6 +2431,205 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
   }
 }
 
+class NearbyStoresPage extends StatefulWidget {
+  const NearbyStoresPage({super.key, required this.product});
+
+  final Garment product;
+
+  @override
+  State<NearbyStoresPage> createState() => _NearbyStoresPageState();
+}
+
+class _NearbyStoresPageState extends State<NearbyStoresPage> {
+  bool loading = true;
+  String? error;
+  bool permissionPermanentlyDenied = false;
+  List<NearbyStore> stores = const [];
+
+  Future<void> loadStores() async {
+    setState(() {
+      loading = true;
+      error = null;
+      permissionPermanentlyDenied = false;
+    });
+    try {
+      final result = await NearbyStoreRepository(
+        source: FirestoreNearbyStoreDataSource(),
+        locationProvider: const GeolocatorUserLocationProvider(),
+      ).findStoresForProduct(widget.product.id);
+      if (!mounted) return;
+      setState(() {
+        stores = result;
+        loading = false;
+      });
+    } on LocationUnavailableException catch (exception) {
+      if (!mounted) return;
+      setState(() {
+        error = exception.message;
+        permissionPermanentlyDenied = exception.permissionPermanentlyDenied;
+        loading = false;
+      });
+    } catch (exception) {
+      if (!mounted) return;
+      setState(() {
+        error = 'No se pudo consultar tiendas e inventario en Firebase.';
+        loading = false;
+      });
+      debugPrint('Nearby store lookup failed: $exception');
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    loadStores();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    backgroundColor: paper,
+    appBar: AppBar(
+      title: const Text('Tiendas cercanas'),
+      backgroundColor: paper,
+    ),
+    body: SafeArea(
+      child: loading
+          ? const Center(child: CircularProgressIndicator(color: ink))
+          : error != null
+          ? _message(
+              icon: Icons.location_disabled_outlined,
+              title: 'No pudimos obtener tu ubicación',
+              subtitle:
+                  '$error\nActiva el servicio de ubicación y permite el acceso mientras usas la app.',
+              action: permissionPermanentlyDenied
+                  ? 'ABRIR AJUSTES'
+                  : 'INTENTAR DE NUEVO',
+              onPressed: permissionPermanentlyDenied
+                  ? Geolocator.openAppSettings
+                  : loadStores,
+            )
+          : stores.isEmpty
+          ? _message(
+              icon: Icons.store_mall_directory_outlined,
+              title: 'No hay tiendas con stock cercano',
+              subtitle:
+                  'Aún no encontramos inventario disponible para ${widget.product.name}. La disponibilidad se consulta en Firebase.',
+              action: 'ACTUALIZAR',
+              onPressed: loadStores,
+            )
+          : ListView(
+              padding: const EdgeInsets.all(18),
+              children: [
+                Text(
+                  widget.product.name,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Ordenadas por distancia desde tu ubicación.',
+                  style: TextStyle(color: muted),
+                ),
+                const SizedBox(height: 14),
+                for (final store in stores)
+                  Card(
+                    color: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      side: const BorderSide(color: line),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: ListTile(
+                      leading: const CircleAvatar(
+                        backgroundColor: lime,
+                        foregroundColor: ink,
+                        child: Icon(Icons.storefront_outlined),
+                      ),
+                      title: Text(
+                        store.name,
+                        style: const TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                      subtitle: Text(
+                        '${store.address}\n${_distanceLabel(store.distanceMeters)} · Stock: ${store.quantity}'
+                        '${store.openingHours == null ? '' : '\n${store.openingHours}'}',
+                      ),
+                      isThreeLine: true,
+                      trailing: IconButton(
+                        icon: const Icon(Icons.map_outlined),
+                        onPressed: () => openStoreLocation(context, store.id),
+                        tooltip: 'Ver en mapa',
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+    ),
+  );
+
+  Widget _message({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required String action,
+    required VoidCallback onPressed,
+  }) => Center(
+    child: Padding(
+      padding: const EdgeInsets.all(28),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 52, color: muted),
+          const SizedBox(height: 12),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            subtitle,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: muted, height: 1.4),
+          ),
+          const SizedBox(height: 16),
+          OutlinedButton(onPressed: onPressed, child: Text(action)),
+        ],
+      ),
+    ),
+  );
+
+  String _distanceLabel(double meters) => meters >= 1000
+      ? '${(meters / 1000).toStringAsFixed(1)} km'
+      : '${meters.round()} m';
+}
+
+class _FadeSlideRoute<T> extends PageRouteBuilder<T> {
+  _FadeSlideRoute({required WidgetBuilder builder})
+      : super(
+          pageBuilder: (context, animation, secondaryAnimation) =>
+              builder(context),
+          transitionDuration: const Duration(milliseconds: 280),
+          reverseTransitionDuration: const Duration(milliseconds: 220),
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            final slide = Tween<Offset>(
+              begin: const Offset(0.04, 0),
+              end: Offset.zero,
+            ).animate(CurvedAnimation(
+              parent: animation,
+              curve: Curves.easeOutCubic,
+            ));
+            return FadeTransition(
+              opacity: CurvedAnimation(
+                parent: animation,
+                curve: Curves.easeOut,
+              ),
+              child: SlideTransition(position: slide, child: child),
+            );
+          },
+        );
+}
 class CircleButton extends StatelessWidget {
   final IconData icon;
   final VoidCallback onTap;
