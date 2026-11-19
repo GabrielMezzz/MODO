@@ -43,6 +43,18 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+/android/app/google-services.json
 
 # Widget Preview related
 .widget_preview/
+
+# Local agent configuration
+.atl/
+
+# Build artifacts
+*.apk
+
+# Other projects cloned inside this workspace (separate Git repositories)
+/App Movil/
+/App_Ropa/
+/App_Tienda_de_ropa/
