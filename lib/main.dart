@@ -10,15 +10,18 @@ import 'package:image_picker/image_picker.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'data/nearby_store_repository.dart';
 import 'data/product_catalog_repository.dart';
 import 'models/garment.dart';
 import 'models/nearby_store.dart';
+import 'features/admin/admin_login_barrier.dart';
+import 'features/fitting_room/models/body_measurements.dart';
+import 'features/fitting_room/services/fit_predictor_service.dart';
+import 'features/fitting_room/widgets/fit_prediction_card.dart';
+import 'features/fitting_room/widgets/privacy_consent_sheet.dart';
+import 'sensor_camera_guide.dart';
 import 'google_sign_in_web_stub.dart' as google_web
     if (dart.library.html) 'package:google_sign_in_web/web_only.dart';
-import 'guided_camera_capture.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -60,13 +63,6 @@ class _ModaAppState extends State<ModaApp> {
     super.initState();
     _initFirebase();
     _loadSavedSession();
-    _requestCameraPermissionOnEntry();
-  }
-
-  Future<void> _requestCameraPermissionOnEntry() async {
-    try {
-      await Permission.camera.request();
-    } catch (_) {}
   }
 
   Future<void> _loadSavedSession() async {
@@ -133,6 +129,9 @@ class _ModaAppState extends State<ModaApp> {
       colorScheme: ColorScheme.fromSeed(seedColor: ink, surface: paper),
       fontFamily: 'Roboto',
     ),
+    routes: {
+      '/admin': (context) => const AdminLoginBarrier(),
+    },
     home: checkingSession
         ? const Scaffold(
             backgroundColor: paper,
@@ -140,15 +139,17 @@ class _ModaAppState extends State<ModaApp> {
               child: CircularProgressIndicator(color: ink),
             ),
           )
-        : signedIn
-            ? ShopShell(
-                customerName: customerName,
-                firebaseConfigured: firebaseConfigured,
-                onSignOut: _handleSignOut,
-              )
-            : LoginScreen(
-                onAuthenticated: _handleSignIn,
-              ),
+        : kIsWeb
+            ? const AdminLoginBarrier()
+            : signedIn
+                ? ShopShell(
+                    customerName: customerName,
+                    firebaseConfigured: firebaseConfigured,
+                    onSignOut: _handleSignOut,
+                  )
+                : LoginScreen(
+                    onAuthenticated: _handleSignIn,
+                  ),
   );
 }
 
@@ -529,6 +530,19 @@ class _LoginScreenState extends State<LoginScreen> {
               ],
             ),
           ),
+          if (kIsWeb) ...[
+            const SizedBox(height: 20),
+            Center(
+              child: TextButton.icon(
+                onPressed: () => Navigator.of(context).pushNamed('/admin'),
+                icon: const Icon(Icons.shield_outlined, size: 14, color: muted),
+                label: const Text(
+                  'Acceso Backoffice Administrador',
+                  style: TextStyle(color: muted, fontSize: 11, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     ),
@@ -608,51 +622,28 @@ class _ShopShellState extends State<ShopShell> {
   StreamSubscription<List<Garment>>? catalogSubscription;
   bool catalogLoading = true;
   String? catalogError;
+  bool _firebaseReady = false;
   Uint8List? frontPhoto, sidePhoto;
   final picker = ImagePicker();
+  FitPredictionResult? fitPredictionResult;
+  bool isPredictingFit = false;
 
   @override
   void initState() {
     super.initState();
-    _syncCatalogSubscription(notify: false);
-  }
-
-  @override
-  void didUpdateWidget(covariant ShopShell oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.firebaseConfigured != widget.firebaseConfigured) {
-      _syncCatalogSubscription();
-    }
-  }
-
-  void _syncCatalogSubscription({bool notify = true}) {
-    void apply(VoidCallback fn) {
-      if (notify && mounted) {
-        setState(fn);
-      } else {
-        fn();
-      }
-    }
-
-    if (!widget.firebaseConfigured) {
-      catalogSubscription?.cancel();
-      catalogSubscription = null;
-      apply(() {
-        catalogLoading = false;
-        catalogError = kIsWeb
-            ? 'La configuración Firebase para web todavía no está agregada.'
-            : 'No se pudo iniciar Firebase. Revisa la configuración de Android.';
-      });
+    _loadSavedBodyMeasurements();
+    _firebaseReady = widget.firebaseConfigured;
+    if (!_firebaseReady && !kIsWeb) {
+      _initFirebaseForShop();
       return;
     }
-
-    if (catalogSubscription != null) return;
-
-    apply(() {
-      catalogLoading = true;
-      catalogError = null;
-    });
-
+    if (!_firebaseReady) {
+      catalogLoading = false;
+      catalogError = kIsWeb
+          ? 'La configuración Firebase para web todavía no está agregada.'
+          : 'No se pudo iniciar Firebase. Revisa la configuración de Android.';
+      return;
+    }
     catalogSubscription = ProductCatalogRepository().watchProducts().listen(
       (items) {
         if (!mounted) return;
@@ -668,7 +659,7 @@ class _ShopShellState extends State<ShopShell> {
         if (!mounted) return;
         setState(() {
           catalogLoading = false;
-          catalogError = 'No se pudo leer la colección productos de Firebase.';
+          catalogError = 'No se pudo leer la colección productos de Firebase: $error';
         });
       },
     );
@@ -678,6 +669,83 @@ class _ShopShellState extends State<ShopShell> {
   void dispose() {
     catalogSubscription?.cancel();
     super.dispose();
+  }
+
+  Future<void> _initFirebaseForShop() async {
+    try {
+      await Firebase.initializeApp();
+      if (!mounted) return;
+      setState(() {
+        _firebaseReady = true;
+        catalogLoading = true;
+        catalogError = null;
+      });
+      catalogSubscription = ProductCatalogRepository().watchProducts().listen(
+        (items) {
+          if (!mounted) return;
+          setState(() {
+            catalogProducts
+              ..clear()
+              ..addAll(items);
+            catalogLoading = false;
+            catalogError = null;
+          });
+        },
+        onError: (Object error) {
+          if (!mounted) return;
+          setState(() {
+            catalogLoading = false;
+            catalogError = 'No se pudo leer la colección productos de Firebase: $error';
+          });
+        },
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        catalogLoading = false;
+        catalogError = 'No se pudo iniciar Firebase. Revisa la configuración de Android. $error';
+      });
+    }
+  }
+
+  Future<void> _loadSavedBodyMeasurements() async {
+    final m = await BodyMeasurements.loadLocal();
+    if (m != null && mounted) {
+      setState(() {
+        fitPredictionResult = FitPredictionResult(
+          recommendedSize: m.recommendedSize,
+          confidencePercent: (m.confidenceScore * 100).toInt(),
+          fitStyle: 'Medidas Guardadas',
+          measurements: m,
+          explanation: 'Basado en tu última calibración con sensor y silueta.',
+        );
+      });
+    }
+  }
+
+  Future<void> _processFitPrediction(Uint8List imageBytes) async {
+    final hasConsent = await BodyMeasurements.hasAcceptedPrivacy();
+    if (!hasConsent && mounted) {
+      final accepted = await PrivacyConsentSheet.show(context);
+      if (!accepted) return;
+    }
+
+    setState(() => isPredictingFit = true);
+    try {
+      final tempDir = Directory.systemTemp;
+      final tempFile = File('${tempDir.path}/temp_fit_body_${DateTime.now().millisecondsSinceEpoch}.jpg');
+      await tempFile.writeAsBytes(imageBytes);
+
+      final result = await const FitPredictorService().predictFromPhoto(imageFile: tempFile);
+      if (mounted) {
+        setState(() {
+          fitPredictionResult = result;
+          isPredictingFit = false;
+        });
+      }
+    } catch (_) {
+      if (mounted) setState(() => isPredictingFit = false);
+    }
   }
 
   List<String> get catalogCategories {
@@ -796,37 +864,130 @@ class _ShopShellState extends State<ShopShell> {
   }
 
   Future<void> pickCapture(bool front) async {
-    final image = await picker.pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 88,
-    );
-    if (image == null) return;
-    final bytes = await image.readAsBytes();
-    setState(() {
-      if (front) {
-        frontPhoto = bytes;
-      } else {
-        sidePhoto = bytes;
-      }
-    });
-  }
-
-  Future<void> openGuidedCapture() async {
-    final result = await Navigator.of(context).push<GuidedCaptureResult>(
-      MaterialPageRoute(
-        builder: (_) => GuidedCameraCapturePage(
-          initialIsFront: frontPhoto == null,
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: paper,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(22, 20, 22, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: lime,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.sensors, size: 22, color: ink),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          front ? 'Foto Frontal con IA' : 'Foto Lateral con IA',
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        const Text(
+                          'Usa el acelerómetro para calibrar el ángulo perpendicular a 90°',
+                          style: TextStyle(fontSize: 12, color: muted),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: ink,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                icon: const Icon(Icons.camera_alt, size: 20),
+                label: const Text(
+                  'Cámara con Sensor IA (Acelerómetro)',
+                  style: TextStyle(fontWeight: FontWeight.w800, fontSize: 13),
+                ),
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  final Uint8List? bytes = await Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => SensorCameraGuideScreen(
+                        front: front,
+                        picker: picker,
+                      ),
+                    ),
+                  );
+                  if (bytes != null) {
+                    setState(() {
+                      if (front) {
+                        frontPhoto = bytes;
+                      } else {
+                        sidePhoto = bytes;
+                      }
+                    });
+                    if (front) {
+                      _processFitPrediction(bytes);
+                    }
+                  }
+                },
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: ink,
+                  side: const BorderSide(color: line),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                ),
+                icon: const Icon(Icons.photo_library_outlined, size: 20),
+                label: const Text(
+                  'Elegir de la Galería',
+                  style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13),
+                ),
+                onPressed: () async {
+                  Navigator.pop(ctx);
+                  final image = await picker.pickImage(
+                    source: ImageSource.gallery,
+                    imageQuality: 88,
+                  );
+                  if (image == null) return;
+                  final bytes = await image.readAsBytes();
+                  setState(() {
+                    if (front) {
+                      frontPhoto = bytes;
+                    } else {
+                      sidePhoto = bytes;
+                    }
+                  });
+                  if (front) {
+                    _processFitPrediction(bytes);
+                  }
+                },
+              ),
+            ],
+          ),
         ),
       ),
     );
-    if (result == null) return;
-    setState(() {
-      if (result.isFront) {
-        frontPhoto = Uint8List.fromList(result.bytes);
-      } else {
-        sidePhoto = Uint8List.fromList(result.bytes);
-      }
-    });
   }
 
   @override
@@ -1447,7 +1608,39 @@ class _ShopShellState extends State<ShopShell> {
                 'Sube dos fotos y descubre cómo te queda.',
                 style: TextStyle(fontSize: 14, color: muted),
               ),
-              const SizedBox(height: 24),
+              const SizedBox(height: 18),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF2F7E6),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: const Color(0xFFD3E7B2)),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(5),
+                      decoration: BoxDecoration(
+                        color: lime,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: const Icon(Icons.sensors, size: 18, color: ink),
+                    ),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text(
+                        'Sensor Acelerómetro activo: calibra el ángulo recto (90°) al tomar la foto.',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF2E5316),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
               Row(
                 children: [
                   Expanded(child: captureCard(true)),
@@ -1455,30 +1648,37 @@ class _ShopShellState extends State<ShopShell> {
                   Expanded(child: captureCard(false)),
                 ],
               ),
-              const SizedBox(height: 14),
-              SizedBox(
-                width: double.infinity,
-                height: 56,
-                child: FilledButton.icon(
-                  onPressed: openGuidedCapture,
-                  icon: const Icon(Icons.photo_camera_outlined),
-                  label: const Text(
-                    'TOMAR FOTO GUIADA (FRONTAL / LATERAL)',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontWeight: FontWeight.w800,
-                      letterSpacing: .2,
-                    ),
+              if (isPredictingFit) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: line),
                   ),
-                  style: FilledButton.styleFrom(
-                    backgroundColor: lime,
-                    foregroundColor: ink,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(color: ink, strokeWidth: 2),
+                      ),
+                      SizedBox(width: 12),
+                      Text(
+                        'Analizando silueta y prediciendo talle óptimo...',
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: ink),
+                      ),
+                    ],
                   ),
                 ),
-              ),
+              ] else if (fitPredictionResult != null) ...[
+                FitPredictionCard(
+                  result: fitPredictionResult!,
+                  onRecalibrate: () => pickCapture(true),
+                ),
+              ],
               const SizedBox(height: 20),
               Container(
                 padding: const EdgeInsets.all(15),
@@ -1977,36 +2177,6 @@ class _ShopShellState extends State<ShopShell> {
   );
 }
 
-const Map<String, String> storeDisplayNames = {
-  'store_real_plaza_huancayo': 'MODO - Real Plaza Huancayo',
-  'store_open_plaza_huancayo': 'MODO - Open Plaza Huancayo',
-  'store_plaza_constitucion': 'MODO - Centro Huancayo',
-};
-
-Future<void> openStoreLocation(BuildContext context, String storeId) async {
-  if (storeId.trim().isEmpty) return;
-  final source = FirestoreNearbyStoreDataSource();
-  final stores = await source.getStores();
-  StoreRecord? store;
-  for (final candidate in stores) {
-    if (candidate.id == storeId) {
-      store = candidate;
-      break;
-    }
-  }
-  if (store == null) return;
-  final uri = Uri.parse(
-    'https://www.google.com/maps/search/?api=1&query=${store.latitude},${store.longitude}',
-  );
-  if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No se pudo abrir el mapa.')),
-      );
-    }
-  }
-}
-
 class ProductDetailPage extends StatefulWidget {
   final Garment product;
   final void Function(Garment product) onAddToCart;
@@ -2247,28 +2417,6 @@ class _ProductDetailPageState extends State<ProductDetailPage> {
                       'Una pieza versátil, cómoda y fácil de combinar. Diseñada para acompañarte en cualquier ocasión.',
                       style: TextStyle(color: muted, fontSize: 12, height: 1.5),
                     ),
-                    if (p.store.isNotEmpty) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        'Tienda: ${storeDisplayNames[p.store] ?? p.store}',
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w700,
-                          fontSize: 13,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      OutlinedButton.icon(
-                        onPressed: () => openStoreLocation(context, p.store),
-                        icon: const Icon(Icons.map_outlined, size: 17),
-                        label: const Text('Ir a la tienda'),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: ink,
-                          side: const BorderSide(color: line),
-                          minimumSize: const Size(double.infinity, 44),
-                          shape: const StadiumBorder(),
-                        ),
-                      ),
-                    ],
                     const SizedBox(height: 15),
                     const Text(
                       'TALLA',
@@ -2556,11 +2704,6 @@ class _NearbyStoresPageState extends State<NearbyStoresPage> {
                         '${store.openingHours == null ? '' : '\n${store.openingHours}'}',
                       ),
                       isThreeLine: true,
-                      trailing: IconButton(
-                        icon: const Icon(Icons.map_outlined),
-                        onPressed: () => openStoreLocation(context, store.id),
-                        tooltip: 'Ver en mapa',
-                      ),
                     ),
                   ),
               ],
